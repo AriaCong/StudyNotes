@@ -13,6 +13,10 @@ A **structured 4-step framework** to navigate any system design interview. The g
 5. [Step 4: Wrap Up](#step-4-wrap-up)
 6. [Time Allocation](#time-allocation)
 7. [Red Flags vs Green Flags](#red-flags-vs-green-flags)
+8. [Background: DNS → HTML Full Flow](#background-dns--html-full-flow)
+9. [Background: SSR vs CSR](#background-ssr-vs-csr)
+10. [Worked Example: Feed System Design](#worked-example-feed-system-design)
+11. [Background: Single Server vs Microservices](#background-single-server-vs-microservices)
 
 ---
 
@@ -81,8 +85,6 @@ DO:     "Design a news feed"  →  ask 10+ clarifying questions first
 ### Example: "Design a Chat System"
 
 ```
-Good clarifying questions:
-
 Q: 1:1 or group chat or both?                → Scope
 Q: Mobile app, web, or both?                  → Clients
 Q: What scale? How many DAU?                  → Scale
@@ -289,7 +291,6 @@ Typical deep dive areas:
 │                                                              │
 │   Total: ~45 minutes                                         │
 │                                                              │
-│   ▓▓▓ = where most candidates spend too little time          │
 │   Step 1 is usually rushed. Step 3 is where you win.         │
 │                                                              │
 └──────────────────────────────────────────────────────────────┘
@@ -340,4 +341,367 @@ For EVERY design decision, follow this pattern:
 
 This pattern — applied consistently — is what separates
 a "pass" from a "strong pass" in system design interviews.
+```
+
+---
+
+## Background: DNS → HTML Full Flow
+
+Understanding the full request path from domain name to rendered page.
+
+### DNS + SSR Flow
+
+```
+User types https://example.com
+      │
+      ▼
+DNS lookup (domain → IP)
+      │
+      ▼
+Browser opens TCP connection to IP
+      │
+      ▼
+TLS handshake (if HTTPS)
+  1. Browser: "I want secure connection, here are ciphers I support"
+  2. Server: "Use this cipher, here is my certificate"
+  3. Browser: verifies certificate (domain match, trusted CA, not expired)
+  4. Both derive shared session keys
+      │
+      ▼
+Browser sends HTTP request (encrypted in TLS tunnel)
+  GET / HTTP/1.1
+  Host: example.com
+      │
+      ▼
+Server generates HTML (SSR)
+      │
+      ▼
+Server returns HTTP response
+  HTTP/1.1 200 OK
+  Content-Type: text/html
+  <html><body>Hello</body></html>
+      │
+      ▼
+Browser renders page
+```
+
+### DNS + CSR (React) Flow
+
+```
+User types https://example.com
+      │
+      ▼
+DNS lookup → IP → TCP → TLS → HTTP request
+      │
+      ▼
+Server returns minimal HTML + JS bundle
+  <div id="root"></div>
+  <script src="bundle.js"></script>
+      │
+      ▼
+Browser downloads and executes JS
+      │
+      ▼
+JS calls API: GET /api/data
+      │
+      ▼
+Server returns JSON
+      │
+      ▼
+JS builds HTML dynamically in browser
+      │
+      ▼
+User sees page
+```
+
+### Key Concepts
+
+```
+DNS         → "Where is the server?" (domain → IP only, NOT HTML)
+TLS         → "Secure the connection" (certificate + encryption)
+HTTP        → "Request/response format" (GET, POST, headers, body)
+HTTPS       → HTTP carried inside encrypted TLS tunnel
+Certificate → Server identity proof (domain + public key + CA signature)
+TLS termination → Gateway/LB decrypts HTTPS, forwards internally
+```
+
+### End-to-End Request Path in Production
+
+```
+Browser
+  │ HTTPS (encrypted)
+  ▼
+CDN / API Gateway / Load Balancer
+  │ TLS termination here
+  │ Auth, rate limit, routing
+  │ HTTP or internal HTTPS
+  ▼
+Backend Service (Order Service, etc.)
+  │ Check Redis cache
+  │ Query Postgres if miss
+  ▼
+Response travels back through gateway → browser
+```
+
+---
+
+## Background: SSR vs CSR
+
+### Server-Side Rendering (SSR)
+
+Server generates complete HTML. Browser receives ready-to-display page.
+
+```
+Browser → Server → Server renders HTML → Browser displays
+```
+
+- Faster first paint (HTML ready on arrival)
+- Better SEO
+- Server does more work
+
+### Client-Side Rendering (CSR)
+
+Server sends minimal HTML + JavaScript. Browser builds the page.
+
+```
+Browser → Server → JS bundle → Browser builds HTML via API calls
+```
+
+- Richer interactivity
+- Server sends less (JSON APIs)
+- Slower first paint, needs JS execution
+
+### Hybrid (Next.js)
+
+```
+First load: SSR (server renders HTML for fast first paint)
+Navigation: CSR (client-side routing, API calls, React takes over)
+```
+
+---
+
+## Worked Example: Feed System Design
+
+A complete example applying the framework to a **feed publishing + retrieval system**.
+
+### High-Level Architecture
+
+```
+                           ┌─────────────────────┐
+                           │      Client App      │
+                           └─────────┬───────────┘
+                                     │
+                           ┌─────────┴───────────┐
+                           │    API Gateway       │
+                           └───────┬─────┬───────┘
+                                   │     │
+                    Publish Post   │     │   Get News Feed
+                                   ▼     ▼
+                     ┌─────────────────┐  ┌────────────────────┐
+                     │   Post Service  │  │ News Feed Service  │
+                     └───────┬─────────┘  └─────────┬──────────┘
+                             │                      │
+                             ▼                      ▼
+                   ┌──────────────────┐    ┌────────────────────┐
+                   │    Post DB       │    │ Timeline/Feed Store│
+                   └────────┬─────────┘    └─────────┬──────────┘
+                            │                        │
+                            ▼                        ▼
+                   ┌──────────────────┐      ┌───────────────────┐
+                   │  Message Queue   │      │ Cache (Redis)     │
+                   └────────┬─────────┘      └───────────────────┘
+                            │
+                 ┌──────────┴───────────┐
+                 ▼                      ▼
+        ┌─────────────────┐    ┌────────────────────┐
+        │  Fanout Service │    │ Notification Svc   │
+        └────────┬────────┘    └────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Follower Graph Store│
+        └─────────────────────┘
+```
+
+### Data Model
+
+```
+posts                          follows                    feed_items
+─────────────                  ───────                    ──────────
+post_id (PK)                   author_id                  user_id
+author_id                      follower_id                post_id
+content                                                   author_id
+media_urls                                                created_at
+created_at                                                rank_score
+status
+
+Redis Cache: feed:{userId}:page:1 → [postId1, postId2, ...]
+```
+
+### Publish Lane (Write Path)
+
+```
+Client
+  │ POST /posts
+  ▼
+Post Service
+  │ 1. Validate auth/content
+  │ 2. Write canonical post → Post DB
+  │ 3. Publish "PostCreated" event → Queue
+  │ 4. Return 201 Created (fast)
+  ▼
+Queue
+  ├──→ Fanout Service
+  │      │ 1. Fetch followers of author
+  │      │ 2. Write post ref into each follower's timeline
+  │      │ 3. Invalidate/update feed cache
+  │      ▼
+  │    Feed Store + Cache
+  │
+  └──→ Notification Service
+         └ Send push/in-app notifications
+```
+
+### Retrieval Lane (Read Path)
+
+```
+Client
+  │ GET /feed?cursor=abc&limit=20
+  ▼
+News Feed Service
+  │ 1. Check Redis cache → HIT? return immediately
+  │ 2. MISS? Read feed item IDs from timeline store
+  │ 3. Hydrate: fetch post content from Post DB/cache
+  │ 4. Hydrate: fetch author info from User Service/cache
+  │ 5. Rank/filter if needed
+  │ 6. Return assembled feed + nextCursor
+  ▼
+Client
+```
+
+### Fanout Strategy: Write vs Read vs Hybrid
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ Strategy         │ How                      │ Trade-off              │
+├──────────────────┼──────────────────────────┼────────────────────────┤
+│ Fanout on Write  │ Push post to all         │ Fast reads, expensive  │
+│                  │ followers' timelines     │ writes for celebrities │
+│                  │ at publish time          │ (write amplification)  │
+├──────────────────┼──────────────────────────┼────────────────────────┤
+│ Fanout on Read   │ Merge posts from         │ Cheap writes, slow     │
+│                  │ followed users at        │ reads (must aggregate  │
+│                  │ read time                │ on every request)      │
+├──────────────────┼──────────────────────────┼────────────────────────┤
+│ Hybrid (real     │ Normal users: write      │ Best balance           │
+│ systems)         │ Celebrity users: read    │                        │
+└──────────────────┴──────────────────────────┴────────────────────────┘
+```
+
+### Hybrid Fanout (What Real Systems Use)
+
+```
+PostCreated event
+   │
+   ▼
+Fanout Service checks author follower count
+   │
+   ├── Normal author (< 1M followers)
+   │      → Push into each follower's timeline (fanout on write)
+   │
+   └── Celebrity author (> 1M followers)
+          → Store canonical post only, mark for read-time merge
+          → News Feed Service merges at read time
+```
+
+### Why Separate Services?
+
+```
+Post Service       → correctness of post creation (write concern)
+News Feed Service  → low-latency reads (read concern)
+Fanout Service     → async, scales independently, retryable via queue
+Notification Svc   → independent, different delivery patterns
+```
+
+### Interview-Ready One-Liner
+
+> When a user publishes a post, the Post Service saves it and emits a PostCreated event. The Fanout Service distributes it to followers' precomputed timelines. When a user opens the feed, the News Feed Service reads from precomputed timelines (cache first), hydrates post/author data, and returns the assembled feed.
+
+---
+
+## Background: Single Server vs Microservices
+
+### Single Server App
+
+```
+User → Browser → HTTPS → Web/App Server → Database
+                            │
+                            ├── routing
+                            ├── business logic
+                            ├── auth
+                            └── HTML/JSON response
+```
+
+- One codebase, one deployment
+- Internal calls are function calls (fast, reliable)
+- Easier debugging, simpler transactions
+- Best for small-medium systems
+
+### Microservice App
+
+```
+User → Browser → HTTPS → API Gateway
+                            │
+                            ├──→ User Service ────→ User DB
+                            ├──→ Order Service ───→ Order DB
+                            │        │
+                            │        └─ HTTP/gRPC → Payment Service → Payment DB
+                            └──→ Product Service → Product DB
+```
+
+- Multiple codebases, independent deployments
+- Internal calls are **network calls** (slower, can fail)
+- Each service owns its DB (no shared DB)
+- Better team ownership, independent scaling
+
+### Key Differences
+
+| Topic | Single Server | Microservices |
+|-------|--------------|---------------|
+| Backend shape | One main app | Many small services |
+| Communication | Function calls | Network calls/messages |
+| Deployment | One deployment | Independent deployments |
+| Database | Often shared DB | DB per service |
+| Complexity | Lower | Higher |
+| Team scaling | Harder as org grows | Better for multiple teams |
+| Failure modes | Simpler | More distributed failures |
+
+### Communication Between Microservices
+
+```
+Synchronous (HTTP/gRPC):
+  Order Service → HTTP → Payment Service → response
+
+Asynchronous (Queue/Events):
+  Order Service → Kafka/SQS → Notification Service
+  (no waiting for response)
+```
+
+### When to Use Which
+
+```
+Start with single server / modular monolith when:
+  ✓ Team is small
+  ✓ Product is early
+  ✓ Traffic is moderate
+  ✓ You want faster delivery
+
+Move to microservices when:
+  ✓ Domains are clearly separable
+  ✓ Multiple teams need independent ownership
+  ✓ Parts need different scaling patterns
+  ✓ Independent deployment matters
+
+⚠ Do NOT start with microservices "because it's scalable"
+   — they trade shipping speed for complexity.
 ```

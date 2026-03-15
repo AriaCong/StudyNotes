@@ -16,6 +16,9 @@ A rate limiter controls the rate of traffic a client can send. If the request co
 8. [Distributed Rate Limiting](#distributed-rate-limiting)
 9. [Race Conditions & Solutions](#race-conditions--solutions)
 10. [Monitoring & Operational Concerns](#monitoring--operational-concerns)
+11. [Background: Client-Side Rate Limiting](#background-client-side-rate-limiting)
+12. [Background: Gateway vs Server-Side Rate Limiting](#background-gateway-vs-server-side-rate-limiting)
+13. [Background: API Gateway, Middleware & SSL Termination](#background-api-gateway-middleware--ssl-termination)
 
 ---
 
@@ -86,11 +89,11 @@ Option 3: Dedicated Service (API Gateway)
 ```
           ┌─────────────────┐
           │  Token Refiller  │  ← adds tokens at fixed rate
-          │  (e.g., 4/sec)  │
+          │  (e.g., 5/sec)  │
           └────────┬────────┘
                    ▼
           ┌─────────────────┐
-          │  Bucket          │  ← max capacity (e.g., 4 tokens)
+          │  Bucket          │  ← max capacity (e.g., 10 tokens)
           │  [●][●][●][●]   │
           └────────┬────────┘
                    │
@@ -112,8 +115,19 @@ Option 3: Dedicated Service (API Gateway)
 | Allows bursts up to bucket size | |
 | Used by Amazon, Stripe | |
 
-**Example:** Bucket size = 4, Refill rate = 4 tokens/sec
-- Can burst 4 requests instantly, then sustained 4/sec
+**Example:** Bucket size = 10, Refill rate = 5 tokens/sec
+
+```
+Timeline:
+  Start: 10 tokens
+  User sends 7 requests quickly → allowed, 3 tokens left
+  User sends 4 more immediately → only 3 allowed, 1 rejected
+  Wait 1 second → 5 tokens refilled → more requests can pass
+
+Why better than "exact 5 per second":
+  Real traffic is bursty. Users don't send requests perfectly evenly.
+  Token bucket handles both steady rate AND burst tolerance.
+```
 
 ---
 
@@ -256,7 +270,6 @@ Weighted count = (prev × overlap%) + current
 ```
 ┌──────────────────────┬────────┬──────────┬──────────┬──────────┐
 │ Algorithm            │ Memory │ Accuracy │ Burst    │ Use When │
-│                      │        │          │ Handling │          │
 ├──────────────────────┼────────┼──────────┼──────────┼──────────┤
 │ Token Bucket         │ Low    │ Good     │ ✓ Yes    │ API rate │
 │                      │        │          │ (burst   │ limiting │
@@ -290,7 +303,6 @@ Weighted count = (prev × overlap%) + current
                │  2. Fetch rules from config             │
                │  3. Check counter in Redis              │
                │  4. Allow or reject (429)               │
-               │                                         │
                └─────────────┬─────────────────────────┘
                              │
                     ┌────────┴────────┐
@@ -444,7 +456,7 @@ Content-Type: application/json
 ### What Happens to Dropped Requests?
 
 ```
-Option 1: Drop immediately → return 429
+Option 1: Drop immediately → return 429 (most common)
 Option 2: Queue for later  → message queue → process when capacity available
 Option 3: Degrade gracefully → serve cached/stale response
 
@@ -480,6 +492,15 @@ Server C: 100/100 ✓                  Server B ──┤
 Total: 300 requests!                 Server C ──┘
 (3× the intended limit)
                                      Total: 100 requests ✓
+```
+
+### Why Distributed is Needed
+
+```
+If you have 5 API servers behind a load balancer:
+  - You want: user A allowed 100 req/min TOTAL
+  - Not: 100 req/min PER SERVER (= 500 total)
+  - So counters must be shared (Redis)
 ```
 
 ### Synchronization Strategies
@@ -611,4 +632,224 @@ ZCARD rate_limit:user123
 ✓ Client communication
     Clear 429 responses with Retry-After header
     Documentation on rate limits per tier
+```
+
+---
+
+## Background: Client-Side Rate Limiting
+
+### What It Is
+
+Rate limiting done in the frontend/mobile/SDK **before the request is sent**.
+
+```
+Examples:
+  - Web app disables repeated button clicks
+  - SDK sends max 3 req/sec
+  - Mobile app queues requests instead of firing too many
+```
+
+### Purpose
+
+- Reducing accidental spam
+- Improving UX
+- Reducing wasted network calls
+- Protecting battery/bandwidth
+
+### Why It's Unreliable
+
+```
+Client-side rate limiting is ADVISORY, not AUTHORITATIVE.
+
+Users can bypass your frontend entirely:
+  - curl / Postman / Python script
+  - Browser dev tools
+  - Modified mobile app
+  - Bot network
+
+  for i in {1..1000}; do
+    curl https://api.example.com/endpoint
+  done
+
+Rule: Anything enforced only on client side is NOT real security.
+      Real enforcement must happen on the server/gateway side.
+```
+
+### When Client-Side Is Useful
+
+```
+✓ UX improvement (disable button after click)
+✓ Reducing accidental duplicate requests
+✓ SDK politeness (don't spam the API)
+✗ NOT for security enforcement
+✗ NOT for abuse prevention
+```
+
+---
+
+## Background: Gateway vs Server-Side Rate Limiting
+
+### Gateway Rate Limiter
+
+Runs **before** requests hit your backend services.
+
+```
+Browser → HTTPS → [Gateway Rate Limiter] → Backend Service
+                         │
+                    Blocks traffic early
+                    Reduces load on backend
+                    Central enforcement
+```
+
+**Best for:**
+- 100 req/min per IP
+- 1000 req/min per API key
+- 10 login attempts/min
+- DDoS/basic abuse control
+
+### Server-Side Rate Limiter
+
+Runs **inside** the backend application/service.
+
+```
+Browser → Gateway → Backend → [Server Rate Limiter] → Business Logic
+                                      │
+                                 Closer to business logic
+                                 Uses business-specific data
+```
+
+**Best for:**
+- User can create only 3 reports per minute
+- Tenant can start only 2 export jobs concurrently
+- AI endpoint allows only N tokens/day per account plan
+
+### Best Practice: Use Both
+
+```
+┌────────────────────────────────────────────────────────────┐
+│ Layer          │ What it protects     │ Examples            │
+├────────────────┼──────────────────────┼─────────────────────┤
+│ Gateway        │ System edge          │ IP limits, API key  │
+│ (coarse)       │ (DDoS, abuse)        │ quotas, auth limits │
+├────────────────┼──────────────────────┼─────────────────────┤
+│ Server-side    │ Application logic    │ Business rules,     │
+│ (fine-grained) │ (specific actions)   │ resource quotas     │
+└────────────────┴──────────────────────┴─────────────────────┘
+
+Gateway limiter protects the SYSTEM EDGE.
+Server limiter protects the APPLICATION LOGIC.
+```
+
+### Rate Limiter Placement in Different Architectures
+
+```
+Single server:
+  Rate limiter in Nginx / app middleware / Redis
+
+Microservices:
+  Rate limiter at API gateway (global protection)
+  + inside each service (business limits)
+  + shared Redis/quota service (distributed limits)
+```
+
+---
+
+## Background: API Gateway, Middleware & SSL Termination
+
+### What Is an API Gateway?
+
+The **front door** to your backend system. Clients call the gateway first; gateway forwards to internal services.
+
+```
+Client → API Gateway → Internal Services
+
+Common responsibilities:
+  - Routing requests to the right service
+  - Authentication / auth checks
+  - Rate limiting
+  - Logging / metrics
+  - SSL termination
+  - CORS handling
+  - Load balancing
+  - API key validation
+  - Request/response transformation
+
+Examples: Kong, NGINX, AWS API Gateway, Envoy, Apigee
+```
+
+### What Is SSL/TLS Termination?
+
+```
+When client uses HTTPS, traffic is encrypted with TLS.
+SSL termination = gateway decrypts the HTTPS traffic there.
+
+Browser ──HTTPS (encrypted)──→ Gateway
+Gateway decrypts request (TLS termination)
+Gateway ──HTTP or internal HTTPS──→ Backend Service
+
+Why:
+  - Centralize certificate management
+  - One place handles TLS handshake overhead
+  - Backend services don't each need public certs
+
+Internal HTTP:
+  - Simpler, less overhead inside private network
+  - Acceptable when internal network is trusted
+
+Internal HTTPS:
+  - Stronger security (zero-trust)
+  - Better for cloud/multi-tenant/regulated systems
+```
+
+### What Is Middleware?
+
+Logic that runs **before or after** your core handler. Cross-cutting concerns.
+
+```
+Common middleware:
+  - Authentication / authorization
+  - Logging / request ID injection
+  - Rate limiting
+  - CORS
+  - Compression
+  - Body size limits
+  - Input validation
+  - Timeout handling
+  - Panic / exception recovery
+  - Metrics collection
+  - CSRF protection
+  - IP filtering
+```
+
+### Full Request Path with All Concepts
+
+```
+1. Client sends HTTPS request
+2. API Gateway receives it
+3. Gateway does:
+   - SSL termination (decrypt)
+   - Auth check
+   - Gateway rate limit
+   - Routing
+4. Backend service receives request
+5. Service middleware does:
+   - Logging, tracing
+   - Server-side/business rate limit
+   - Validation
+6. Service checks cache (Redis)
+7. If cache miss, queries DB
+8. Returns response back through gateway to browser
+```
+
+### One-Sentence Definitions
+
+```
+Token bucket    → Allow bursts, control long-term request rate
+Client limiter  → Polite client behavior, NOT real security
+Distributed     → Shared quota across many server instances
+Cache server    → Fast shared in-memory store for hot data
+API gateway     → Front door that handles cross-cutting concerns
+Middleware      → Reusable logic around request processing
+Gateway limiter → Edge-level protection (DDoS, abuse)
+Server limiter  → Business-logic-level protection (quotas)
 ```
